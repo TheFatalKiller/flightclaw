@@ -4,21 +4,21 @@
   "initial_test_sent": true,
   "last_best": {
     "airlines": [
-      "Malaysia Airlines"
+      "Qatar Airways"
     ],
-    "date": "2027-01-13",
+    "date": "2027-01-12",
     "destination": "PER",
-    "duration": 1205,
+    "duration": 1155,
     "flight_numbers": [
-      "MH1",
-      "MH127"
+      "QR110",
+      "QR900"
     ],
     "origin_code": "LHR",
     "origin_name": "London Heathrow Airport",
-    "price": 802.0,
+    "price": 887.0,
     "stops": 1
   },
-  "last_seen_price": 802.0,
+  "last_seen_price": 887.0,
   "lowest_price": 802.0,
   "record_best": {
     "airlines": [

@@ -1,38 +1,39 @@
 {
   "availability_missing": false,
+  "filter_signature": "LON-PER-2027-01-10_13-economy-max1-no-self-transfer-no-airport-change-under25h-v1",
   "initial_test_sent": true,
   "last_best": {
     "airlines": [
-      "China Southern Airlines"
+      "Malaysia Airlines"
     ],
-    "date": "2027-01-11",
+    "date": "2027-01-13",
     "destination": "PER",
-    "duration": 1655,
+    "duration": 1205,
     "flight_numbers": [
-      "CZ690",
-      "CZ319"
+      "MH1",
+      "MH127"
     ],
-    "origin_code": "LGW",
-    "origin_name": "London Gatwick Airport",
-    "price": 751.0,
+    "origin_code": "LHR",
+    "origin_name": "London Heathrow Airport",
+    "price": 802.0,
     "stops": 1
   },
-  "last_seen_price": 751.0,
-  "lowest_price": 751.0,
+  "last_seen_price": 802.0,
+  "lowest_price": 802.0,
   "record_best": {
     "airlines": [
-      "China Southern Airlines"
+      "Malaysia Airlines"
     ],
-    "date": "2027-01-11",
+    "date": "2027-01-13",
     "destination": "PER",
-    "duration": 1655,
+    "duration": 1205,
     "flight_numbers": [
-      "CZ690",
-      "CZ319"
+      "MH1",
+      "MH127"
     ],
-    "origin_code": "LGW",
-    "origin_name": "London Gatwick Airport",
-    "price": 751.0,
+    "origin_code": "LHR",
+    "origin_name": "London Heathrow Airport",
+    "price": 802.0,
     "stops": 1
   }
 }

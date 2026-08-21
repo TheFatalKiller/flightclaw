@@ -1,0 +1,2015 @@
+name: Perth Flight Price Alerts
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Check approximately every 5 minutes
+    - cron: "2-57/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: perth-flight-price-tracker
+  cancel-in-progress: false
+
+jobs:
+  check-flights:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Google Flights library
+        run: |
+          python -m pip install --upgrade pip
+          pip install "flights==0.9.0"
+
+      - name: Check London to Perth fares
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+          from datetime import datetime
+          from pathlib import Path
+
+          from fli.models import (
+              Airport,
+              FlightSearchFilters,
+              FlightSegment,
+              MaxStops,
+              PassengerInfo,
+              SeatType,
+              SortBy,
+              TripType,
+          )
+          from fli.search import SearchFlights
+
+
+          # ============================================================
+          # TRACKER SETTINGS
+          # ============================================================
+
+          DATES = [
+              "2027-01-10",
+              "2027-01-11",
+              "2027-01-12",
+              "2027-01-13",
+          ]
+
+          LONDON_AIRPORTS = [
+              Airport.LHR,
+              Airport.LGW,
+              Airport.STN,
+              Airport.LTN,
+              Airport.LCY,
+              Airport.SEN,
+          ]
+
+          DESTINATION = Airport.PER
+
+          # HIGH priority BELOW £750
+          HIGH_PRIORITY_PRICE = 750
+
+          # URGENT priority BELOW £700
+          URGENT_PRICE = 700
+
+          # Journey must be STRICTLY under 25 hours.
+          # 24h59 qualifies.
+          # 25h00 does not.
+          MAX_DURATION_MINUTES = 25 * 60
+
+          # Maximum number of itineraries per date for which
+          # we will ask Google for actual booking sellers.
+          #
+          # Normally only 1-3 calls are needed because results
+          # are already sorted by cheapest.
+          MAX_BOOKING_ATTEMPTS_PER_DATE = 8
+
+          # Changing this resets the old price baseline once,
+          # WITHOUT sending the original tracker TEST again.
+          FILTER_SIGNATURE = (
+              "LON-PER-2027-01-10_13-"
+              "economy-max1-no-self-transfer-"
+              "no-airport-change-under25h-"
+              "verified-google-booking-source-v1"
+          )
+
+          STATE_FILE = Path(
+              ".flight-alert-state.json"
+          )
+
+          NTFY_TOPIC = os.environ.get(
+              "NTFY_TOPIC",
+              "",
+          ).strip()
+
+          GOOGLE_FLIGHTS_URL = (
+              "https://www.google.com/travel/flights"
+              "?hl=en-GB&curr=GBP&gl=GB"
+          )
+
+          if not NTFY_TOPIC:
+              raise RuntimeError(
+                  "NTFY_TOPIC is missing."
+              )
+
+
+          # ============================================================
+          # NTFY
+          # ============================================================
+
+          def normalise_url(url):
+
+              if not url:
+                  return GOOGLE_FLIGHTS_URL
+
+              url = str(url).strip()
+
+              if url.startswith("//"):
+                  return "https:" + url
+
+              if not url.startswith(
+                  ("http://", "https://")
+              ):
+                  return "https://" + url
+
+              return url
+
+
+          def send_notification(
+              title,
+              message,
+              priority=3,
+              tags=None,
+              click_url=None,
+          ):
+
+              if tags is None:
+                  tags = ["airplane"]
+
+              payload = {
+                  "topic": NTFY_TOPIC,
+                  "title": title,
+                  "message": message,
+                  "priority": int(priority),
+                  "tags": tags,
+                  "click": normalise_url(
+                      click_url
+                      or GOOGLE_FLIGHTS_URL
+                  ),
+              }
+
+              request = urllib.request.Request(
+                  "https://ntfy.sh",
+                  data=json.dumps(
+                      payload
+                  ).encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "Content-Type":
+                      "application/json",
+                  },
+              )
+
+              with urllib.request.urlopen(
+                  request,
+                  timeout=20,
+              ) as response:
+
+                  print(
+                      "ntfy notification sent: "
+                      f"{response.status} {title}"
+                  )
+
+
+          # ============================================================
+          # HELPERS
+          # ============================================================
+
+          def enum_code(value):
+
+              if value is None:
+                  return "Unknown"
+
+              name = getattr(
+                  value,
+                  "name",
+                  None,
+              )
+
+              if name:
+                  return str(
+                      name
+                  ).removeprefix("_")
+
+              return str(value)
+
+
+          def enum_label(value):
+
+              if value is None:
+                  return "Unknown"
+
+              label = getattr(
+                  value,
+                  "value",
+                  None,
+              )
+
+              if label is not None:
+                  return str(label)
+
+              return enum_code(value)
+
+
+          def format_duration(minutes):
+
+              minutes = int(minutes)
+
+              hours = minutes // 60
+              mins = minutes % 60
+
+              return (
+                  f"{hours}h {mins:02d}m"
+              )
+
+
+          def format_date(date_string):
+
+              return datetime.strptime(
+                  date_string,
+                  "%Y-%m-%d",
+              ).strftime(
+                  "%d %b %Y"
+              )
+
+
+          def priority_for_price(price):
+
+              price = float(price)
+
+              if price < URGENT_PRICE:
+                  return 5
+
+              if price < HIGH_PRIORITY_PRICE:
+                  return 4
+
+              return 3
+
+
+          def has_airport_change(flight):
+
+              for layover in (
+                  flight.layovers or []
+              ):
+
+                  if getattr(
+                      layover,
+                      "change_of_airport",
+                      False,
+                  ):
+                      return True
+
+              for current_leg, next_leg in zip(
+                  flight.legs,
+                  flight.legs[1:],
+              ):
+
+                  if (
+                      current_leg.arrival_airport
+                      !=
+                      next_leg.departure_airport
+                  ):
+                      return True
+
+              return False
+
+
+          # ============================================================
+          # BOOKING-OPTION HELPERS
+          # ============================================================
+
+          def seller_name(option):
+
+              name = getattr(
+                  option,
+                  "vendor_name",
+                  None,
+              )
+
+              if name:
+                  return str(name)
+
+              code = getattr(
+                  option,
+                  "vendor_code",
+                  None,
+              )
+
+              if code:
+                  return str(code)
+
+              return None
+
+
+          def seller_type(option):
+
+              if getattr(
+                  option,
+                  "is_airline_direct",
+                  False,
+              ):
+                  return "Airline direct ✅"
+
+              return "OTA / travel agent"
+
+
+          def usable_booking_options(options):
+
+              usable = []
+
+              for option in options or []:
+
+                  price = getattr(
+                      option,
+                      "price",
+                      None,
+                  )
+
+                  if price is None:
+                      continue
+
+                  currency = getattr(
+                      option,
+                      "currency",
+                      None,
+                  )
+
+                  # We requested GBP.
+                  # Google sometimes omits the currency
+                  # token from individual booking rows,
+                  # so None is accepted as GBP here.
+                  if (
+                      currency
+                      and str(currency).upper()
+                      != "GBP"
+                  ):
+                      continue
+
+                  seller = seller_name(
+                      option
+                  )
+
+                  if not seller:
+                      continue
+
+                  usable.append(
+                      option
+                  )
+
+              usable.sort(
+                  key=lambda option:
+                  float(option.price)
+              )
+
+              return usable
+
+
+          # ============================================================
+          # FLIGHT DESCRIPTION
+          # ============================================================
+
+          def make_candidate(
+              flight,
+              date,
+              booking_option,
+              seller_count,
+          ):
+
+              if not flight.legs:
+                  raise ValueError(
+                      "Flight contains no legs."
+                  )
+
+              first_leg = flight.legs[0]
+
+              airlines = []
+              flight_numbers = []
+
+              for leg in flight.legs:
+
+                  airline_name = enum_label(
+                      leg.airline
+                  )
+
+                  airline_code = enum_code(
+                      leg.airline
+                  )
+
+                  if airline_name not in airlines:
+                      airlines.append(
+                          airline_name
+                      )
+
+                  number = str(
+                      leg.flight_number or ""
+                  ).strip()
+
+                  if number:
+
+                      if number.upper().startswith(
+                          airline_code.upper()
+                      ):
+                          display_number = number
+
+                      else:
+                          display_number = (
+                              f"{airline_code}"
+                              f"{number}"
+                          )
+
+                      flight_numbers.append(
+                          display_number
+                      )
+
+              booking_url = getattr(
+                  booking_option,
+                  "booking_url",
+                  None,
+              )
+
+              google_click_url = getattr(
+                  booking_option,
+                  "google_click_url",
+                  None,
+              )
+
+              # Prefer Google's booking click-through link,
+              # then the seller's own URL.
+              click_url = (
+                  google_click_url
+                  or booking_url
+                  or GOOGLE_FLIGHTS_URL
+              )
+
+              fare_name = getattr(
+                  booking_option,
+                  "fare_name",
+                  None,
+              )
+
+              return {
+                  # IMPORTANT:
+                  # price is now the REAL BOOKING OPTION
+                  # price, not merely the shopping headline.
+                  "price": round(
+                      float(
+                          booking_option.price
+                      ),
+                      2,
+                  ),
+
+                  "shopping_price": round(
+                      float(flight.price),
+                      2,
+                  ),
+
+                  "date": date,
+
+                  "origin_code": enum_code(
+                      first_leg.departure_airport
+                  ),
+
+                  "origin_name": enum_label(
+                      first_leg.departure_airport
+                  ),
+
+                  "destination": "PER",
+
+                  "stops": int(
+                      flight.stops
+                  ),
+
+                  "airlines": airlines,
+
+                  "flight_numbers":
+                      flight_numbers,
+
+                  "duration": int(
+                      flight.duration
+                  ),
+
+                  "seller": seller_name(
+                      booking_option
+                  ),
+
+                  "seller_type": seller_type(
+                      booking_option
+                  ),
+
+                  "airline_direct": bool(
+                      getattr(
+                          booking_option,
+                          "is_airline_direct",
+                          False,
+                      )
+                  ),
+
+                  "fare_name": (
+                      str(fare_name)
+                      if fare_name
+                      else None
+                  ),
+
+                  "seller_count": int(
+                      seller_count
+                  ),
+
+                  "click_url": normalise_url(
+                      click_url
+                  ),
+              }
+
+
+          def flight_details(best):
+
+              if best["stops"] == 0:
+                  stops_text = "Direct"
+              else:
+                  stops_text = "1 stop"
+
+              lines = [
+                  "London → Perth",
+
+                  (
+                      "One way: "
+                      f"{format_date(best['date'])}"
+                  ),
+
+                  (
+                      f"From: {best['origin_code']} "
+                      f"({best['origin_name']})"
+                  ),
+
+                  (
+                      "Verified booking price: "
+                      f"£{float(best['price']):.0f}"
+                  ),
+
+                  (
+                      f"Stops: {stops_text}"
+                  ),
+
+                  (
+                      "Duration: "
+                      f"{format_duration(best['duration'])}"
+                  ),
+
+                  (
+                      "Airlines: "
+                      f"{', '.join(best['airlines'])}"
+                  ),
+
+                  (
+                      "Flights: "
+                      f"{', '.join(best['flight_numbers'])}"
+                  ),
+
+                  (
+                      "Book with: "
+                      f"{best['seller']}"
+                  ),
+
+                  (
+                      "Seller type: "
+                      f"{best['seller_type']}"
+                  ),
+              ]
+
+              fare_name = best.get(
+                  "fare_name"
+              )
+
+              if fare_name:
+
+                  lines.append(
+                      f"Fare: {fare_name}"
+                  )
+
+              shopping_price = float(
+                  best.get(
+                      "shopping_price",
+                      best["price"],
+                  )
+              )
+
+              booking_price = float(
+                  best["price"]
+              )
+
+              if (
+                  abs(
+                      shopping_price
+                      - booking_price
+                  )
+                  > 0.01
+              ):
+
+                  lines.append(
+                      "Google headline price: "
+                      f"£{shopping_price:.0f}"
+                  )
+
+              lines.extend([
+                  (
+                      "Priced booking sellers found: "
+                      f"{best.get('seller_count', 1)}"
+                  ),
+
+                  (
+                      "Source verified through "
+                      "Google Flights booking options"
+                  ),
+
+                  "Maximum journey: under 25h",
+
+                  (
+                      "Explicit self-transfer "
+                      "itineraries excluded"
+                  ),
+
+                  (
+                      "Airport-change connections "
+                      "excluded"
+                  ),
+              ])
+
+              return "\n".join(
+                  lines
+              )
+
+
+          def previous_details(best):
+
+              if not isinstance(
+                  best,
+                  dict,
+              ):
+                  return ""
+
+              date = best.get(
+                  "date"
+              )
+
+              if date:
+                  date_text = format_date(
+                      date
+                  )
+              else:
+                  date_text = "Unknown"
+
+              origin = best.get(
+                  "origin_code",
+                  "London",
+              )
+
+              airlines = ", ".join(
+                  best.get(
+                      "airlines"
+                  ) or []
+              )
+
+              if not airlines:
+                  airlines = "Unknown airline"
+
+              seller = best.get(
+                  "seller"
+              )
+
+              seller_text = ""
+
+              if seller:
+                  seller_text = (
+                      f", seller: {seller}"
+                  )
+
+              duration = best.get(
+                  "duration"
+              )
+
+              duration_text = ""
+
+              if duration is not None:
+                  duration_text = (
+                      ", "
+                      + format_duration(
+                          duration
+                      )
+                  )
+
+              return (
+                  "Previous itinerary: "
+                  f"{date_text}, "
+                  f"{origin} → PER, "
+                  f"{airlines}"
+                  f"{duration_text}"
+                  f"{seller_text}"
+              )
+
+
+          def safe_state_best(best):
+
+              if not isinstance(
+                  best,
+                  dict,
+              ):
+                  return None
+
+              # Don't persist temporary booking
+              # redirect URLs in the repository.
+              return {
+                  key: value
+                  for key, value in best.items()
+                  if key != "click_url"
+              }
+
+
+          # ============================================================
+          # STATE
+          # ============================================================
+
+          def default_state():
+
+              return {
+                  "filter_signature":
+                      FILTER_SIGNATURE,
+
+                  "initial_test_sent":
+                      False,
+
+                  "baseline_pending":
+                      False,
+
+                  "lowest_price":
+                      None,
+
+                  "record_best":
+                      None,
+
+                  "last_seen_price":
+                      None,
+
+                  "last_best":
+                      None,
+
+                  "availability_missing":
+                      False,
+              }
+
+
+          def reset_for_new_filters(
+              initial_test_sent,
+          ):
+
+              return {
+                  "filter_signature":
+                      FILTER_SIGNATURE,
+
+                  "initial_test_sent":
+                      bool(
+                          initial_test_sent
+                      ),
+
+                  # First successful run with
+                  # booking verification establishes
+                  # the new baseline silently.
+                  "baseline_pending":
+                      True,
+
+                  "lowest_price":
+                      None,
+
+                  "record_best":
+                      None,
+
+                  "last_seen_price":
+                      None,
+
+                  "last_best":
+                      None,
+
+                  "availability_missing":
+                      False,
+              }
+
+
+          def load_state():
+
+              if not STATE_FILE.exists():
+                  return default_state()
+
+              try:
+
+                  stored = json.loads(
+                      STATE_FILE.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+
+                  if (
+                      stored.get(
+                          "filter_signature"
+                      )
+                      != FILTER_SIGNATURE
+                  ):
+
+                      print(
+                          "Booking-source rules "
+                          "changed. Resetting price "
+                          "baseline without sending "
+                          "another TEST."
+                      )
+
+                      return (
+                          reset_for_new_filters(
+                              stored.get(
+                                  "initial_test_sent",
+                                  False,
+                              )
+                          )
+                      )
+
+                  state = default_state()
+
+                  state.update(
+                      stored
+                  )
+
+                  return state
+
+              except Exception as exc:
+
+                  print(
+                      "Could not load state: "
+                      f"{exc}"
+                  )
+
+                  return default_state()
+
+
+          def save_state(state):
+
+              state[
+                  "filter_signature"
+              ] = FILTER_SIGNATURE
+
+              STATE_FILE.write_text(
+                  json.dumps(
+                      state,
+                      indent=2,
+                      sort_keys=True,
+                  )
+                  + "\n",
+                  encoding="utf-8",
+              )
+
+
+          # ============================================================
+          # BUILD GOOGLE SEARCH
+          # ============================================================
+
+          def build_filters(date):
+
+              return FlightSearchFilters(
+
+                  trip_type=TripType.ONE_WAY,
+
+                  passenger_info=PassengerInfo(
+                      adults=1
+                  ),
+
+                  flight_segments=[
+                      FlightSegment(
+
+                          departure_airport=[
+                              [airport, 0]
+                              for airport
+                              in LONDON_AIRPORTS
+                          ],
+
+                          arrival_airport=[
+                              [DESTINATION, 0]
+                          ],
+
+                          travel_date=date,
+                      )
+                  ],
+
+                  seat_type=SeatType.ECONOMY,
+
+                  stops=(
+                      MaxStops
+                      .ONE_STOP_OR_FEWER
+                  ),
+
+                  sort_by=SortBy.CHEAPEST,
+
+                  show_all_results=True,
+              )
+
+
+          # ============================================================
+          # SEARCH + BOOKING VERIFICATION
+          # ============================================================
+
+          def search_date(date):
+
+              filters = build_filters(
+                  date
+              )
+
+              # IMPORTANT:
+              # The SAME SearchFlights instance
+              # performs the search and subsequent
+              # booking-option request.
+              #
+              # This lets Fli retain Google's
+              # shopping session data.
+              search = SearchFlights()
+
+              flights = search.search(
+                  filters,
+                  currency="GBP",
+                  language="en-GB",
+                  country="GB",
+              ) or []
+
+              print(
+                  "Google shopping results: "
+                  f"{len(flights)}"
+              )
+
+              valid = []
+
+              no_price = 0
+              no_duration = 0
+              too_long = 0
+              too_many_stops = 0
+              self_transfer = 0
+              airport_change = 0
+              wrong_currency = 0
+
+              for flight in flights:
+
+                  if flight.price is None:
+                      no_price += 1
+                      continue
+
+                  if int(
+                      flight.stops
+                  ) > 1:
+
+                      too_many_stops += 1
+                      continue
+
+                  if getattr(
+                      flight,
+                      "duration",
+                      None,
+                  ) is None:
+
+                      no_duration += 1
+                      continue
+
+                  if int(
+                      flight.duration
+                  ) >= MAX_DURATION_MINUTES:
+
+                      too_long += 1
+                      continue
+
+                  if getattr(
+                      flight,
+                      "self_transfer",
+                      None,
+                  ) is True:
+
+                      self_transfer += 1
+                      continue
+
+                  if has_airport_change(
+                      flight
+                  ):
+
+                      airport_change += 1
+                      continue
+
+                  currency = getattr(
+                      flight,
+                      "currency",
+                      None,
+                  )
+
+                  if (
+                      currency
+                      and str(
+                          currency
+                      ).upper()
+                      != "GBP"
+                  ):
+
+                      wrong_currency += 1
+                      continue
+
+                  valid.append(
+                      flight
+                  )
+
+              valid.sort(
+                  key=lambda flight:
+                  float(flight.price)
+              )
+
+              print(
+                  f"Valid shopping itineraries: "
+                  f"{len(valid)}"
+              )
+
+              print(
+                  "Rejected — "
+                  f"no price: {no_price}, "
+                  f"no duration: {no_duration}, "
+                  f">=25h: {too_long}, "
+                  f">1 stop: {too_many_stops}, "
+                  f"self-transfer: {self_transfer}, "
+                  f"airport change: {airport_change}, "
+                  f"wrong currency: {wrong_currency}"
+              )
+
+              # --------------------------------------------------------
+              # FOLLOW GOOGLE INTO THE "BOOKING OPTIONS" STEP
+              # --------------------------------------------------------
+
+              best_verified = None
+
+              attempts = 0
+
+              for flight in valid:
+
+                  shopping_price = float(
+                      flight.price
+                  )
+
+                  # If we already have a verified
+                  # seller at £X, and Google's next
+                  # headline result is £X or higher,
+                  # we have reached the useful price
+                  # floor for this date.
+                  if (
+                      best_verified is not None
+                      and shopping_price
+                      >= float(
+                          best_verified["price"]
+                      )
+                      - 0.01
+                  ):
+                      break
+
+                  if (
+                      attempts
+                      >=
+                      MAX_BOOKING_ATTEMPTS_PER_DATE
+                  ):
+
+                      raise RuntimeError(
+                          "Booking-verification cap "
+                          "was reached before the "
+                          "cheapest bookable fare "
+                          "could be proven. "
+                          "State will not be changed."
+                      )
+
+                  attempts += 1
+
+                  print(
+                      "Checking actual booking "
+                      f"options for £{shopping_price:.0f} "
+                      f"itinerary..."
+                  )
+
+                  try:
+
+                      options = (
+                          search.get_booking_options(
+                              flight,
+                              filters,
+                              currency="GBP",
+                              language="en-GB",
+                              country="GB",
+
+                              # Prefer Google's
+                              # actual row token when
+                              # Fli parsed one.
+                              booking_token=(
+                                  getattr(
+                                      flight,
+                                      "booking_token",
+                                      None,
+                                  )
+                                  or None
+                              ),
+                          )
+                          or []
+                      )
+
+                  except Exception as exc:
+
+                      # Booking verification is now
+                      # part of the safety check.
+                      #
+                      # Do NOT infer that a fare
+                      # disappeared merely because
+                      # Google's booking endpoint
+                      # failed.
+                      raise RuntimeError(
+                          "Google booking-option "
+                          "verification failed for "
+                          f"{date}: {exc}"
+                      ) from exc
+
+                  bookable = (
+                      usable_booking_options(
+                          options
+                      )
+                  )
+
+                  print(
+                      "Priced booking sellers "
+                      f"returned: {len(bookable)}"
+                  )
+
+                  if not bookable:
+                      continue
+
+                  cheapest_option = (
+                      bookable[0]
+                  )
+
+                  candidate = (
+                      make_candidate(
+                          flight,
+                          date,
+                          cheapest_option,
+                          len(bookable),
+                      )
+                  )
+
+                  print(
+                      "VERIFIED: "
+                      f"£{candidate['price']:.0f} "
+                      f"with {candidate['seller']} "
+                      f"({candidate['seller_type']})"
+                  )
+
+                  if (
+                      best_verified is None
+                      or float(
+                          candidate["price"]
+                      )
+                      <
+                      float(
+                          best_verified["price"]
+                      )
+                      - 0.01
+                  ):
+
+                      best_verified = (
+                          candidate
+                      )
+
+                  # Small courtesy delay between
+                  # booking-result requests.
+                  time.sleep(0.35)
+
+              if best_verified is None:
+
+                  # If every valid shopping result
+                  # was actually checked, then there
+                  # really was no priced booking
+                  # seller we could verify.
+                  if (
+                      len(valid)
+                      >
+                      MAX_BOOKING_ATTEMPTS_PER_DATE
+                  ):
+
+                      raise RuntimeError(
+                          "No verified booking option "
+                          "was found before the "
+                          "verification cap. "
+                          "Refusing to treat the date "
+                          "as unavailable."
+                      )
+
+                  return []
+
+              return [
+                  best_verified
+              ]
+
+
+          # ============================================================
+          # SEARCH ALL FOUR DATES
+          # ============================================================
+
+          candidates = []
+
+          successful_searches = 0
+
+          for date in DATES:
+
+              print("")
+              print(
+                  "=================================="
+              )
+
+              print(
+                  "SEARCHING + VERIFYING "
+                  f"{date}"
+              )
+
+              print(
+                  "=================================="
+              )
+
+              try:
+
+                  results = search_date(
+                      date
+                  )
+
+                  successful_searches += 1
+
+                  candidates.extend(
+                      results
+                  )
+
+              except Exception as exc:
+
+                  print(
+                      "Search/verification failed "
+                      f"for {date}: {exc}"
+                  )
+
+              time.sleep(2)
+
+
+          # ============================================================
+          # ANTI-FALSE-ALERT SAFETY
+          # ============================================================
+
+          if successful_searches != len(
+              DATES
+          ):
+
+              raise RuntimeError(
+                  f"Only {successful_searches}/"
+                  f"{len(DATES)} dates completed "
+                  "both search AND booking "
+                  "verification successfully. "
+                  "Tracker state was NOT changed."
+              )
+
+
+          state = load_state()
+
+
+          # ============================================================
+          # NO VERIFIED BOOKABLE MATCH
+          # ============================================================
+
+          if not candidates:
+
+              print(
+                  "No VERIFIED bookable matching "
+                  "fare is currently showing."
+              )
+
+              if not state.get(
+                  "initial_test_sent",
+                  False,
+              ):
+
+                  send_notification(
+
+                      "✅ TEST — Flight tracker is LIVE",
+
+                      (
+                          "The automated tracker "
+                          "is running successfully.\n\n"
+                          "London → Perth\n"
+                          "10–13 Jan 2027\n"
+                          "Economy\n"
+                          "Maximum 1 stop\n"
+                          "Under 25 hours\n"
+                          "No explicit self-transfer\n"
+                          "No airport change\n"
+                          "Booking seller verification enabled\n\n"
+                          "No verified bookable fare "
+                          "is currently showing."
+                      ),
+
+                      priority=3,
+
+                      tags=[
+                          "white_check_mark",
+                          "airplane",
+                      ],
+                  )
+
+                  state[
+                      "initial_test_sent"
+                  ] = True
+
+                  state[
+                      "baseline_pending"
+                  ] = False
+
+              elif state.get(
+                  "baseline_pending",
+                  False,
+              ):
+
+                  print(
+                      "New booking-verification "
+                      "baseline established with "
+                      "no available verified fare. "
+                      "No notification sent."
+                  )
+
+                  state[
+                      "baseline_pending"
+                  ] = False
+
+              elif not state.get(
+                  "availability_missing",
+                  False,
+              ):
+
+                  previous_price = state.get(
+                      "last_seen_price"
+                  )
+
+                  old_best = state.get(
+                      "last_best"
+                  )
+
+                  message = (
+                      "No London → Perth fare "
+                      "matching all filters currently "
+                      "has a priced booking seller "
+                      "verified through Google Flights."
+                  )
+
+                  if (
+                      previous_price
+                      is not None
+                  ):
+
+                      message += (
+                          "\n\nPrevious cheapest: "
+                          f"£{float(previous_price):.0f}"
+                      )
+
+                  old_description = (
+                      previous_details(
+                          old_best
+                      )
+                  )
+
+                  if old_description:
+
+                      message += (
+                          "\n"
+                          + old_description
+                      )
+
+                  send_notification(
+
+                      "⚠️ CHEAPER FARE DISAPPEARED",
+
+                      message,
+
+                      priority=(
+                          priority_for_price(
+                              previous_price
+                          )
+                          if previous_price
+                          is not None
+                          else 3
+                      ),
+
+                      tags=[
+                          "warning",
+                          "airplane",
+                      ],
+                  )
+
+              state[
+                  "availability_missing"
+              ] = True
+
+              state[
+                  "last_seen_price"
+              ] = None
+
+              state[
+                  "last_best"
+              ] = None
+
+              save_state(
+                  state
+              )
+
+
+          # ============================================================
+          # VERIFIED BOOKABLE FARES EXIST
+          # ============================================================
+
+          else:
+
+              candidates.sort(
+                  key=lambda item:
+                  float(item["price"])
+              )
+
+              best = candidates[0]
+
+              current_price = float(
+                  best["price"]
+              )
+
+              details = flight_details(
+                  best
+              )
+
+              print("")
+              print(
+                  "=================================="
+              )
+
+              print(
+                  "CURRENT CHEAPEST VERIFIED "
+                  "BOOKABLE FARE"
+              )
+
+              print(
+                  "=================================="
+              )
+
+              print(
+                  details
+              )
+
+              old_lowest = state.get(
+                  "lowest_price"
+              )
+
+              previous_price = state.get(
+                  "last_seen_price"
+              )
+
+              old_best = state.get(
+                  "last_best"
+              )
+
+              was_missing = bool(
+                  state.get(
+                      "availability_missing",
+                      False,
+                  )
+              )
+
+              baseline_pending = bool(
+                  state.get(
+                      "baseline_pending",
+                      False,
+                  )
+              )
+
+
+              # ========================================================
+              # ORIGINAL FIRST TEST
+              # ========================================================
+
+              if not state.get(
+                  "initial_test_sent",
+                  False,
+              ):
+
+                  send_notification(
+
+                      "✅ TEST — Flight tracker is LIVE",
+
+                      (
+                          "The automated tracker "
+                          "is running successfully.\n\n"
+                          + details
+                          + "\n\n"
+                          "All alerts now use a "
+                          "priced Google Flights "
+                          "booking seller."
+                      ),
+
+                      priority=3,
+
+                      tags=[
+                          "white_check_mark",
+                          "airplane",
+                      ],
+
+                      click_url=best[
+                          "click_url"
+                      ],
+                  )
+
+                  state[
+                      "initial_test_sent"
+                  ] = True
+
+                  state[
+                      "baseline_pending"
+                  ] = False
+
+                  state[
+                      "lowest_price"
+                  ] = current_price
+
+                  state[
+                      "record_best"
+                  ] = safe_state_best(
+                      best
+                  )
+
+                  print(
+                      "FIRST-RUN TEST SENT"
+                  )
+
+
+              # ========================================================
+              # NEW SELLER-VERIFIED BASELINE
+              # ========================================================
+
+              elif baseline_pending:
+
+                  # This prevents the migration from
+                  # your old headline-price tracker
+                  # from sending a fake "new lowest"
+                  # notification.
+                  state[
+                      "baseline_pending"
+                  ] = False
+
+                  state[
+                      "lowest_price"
+                  ] = current_price
+
+                  state[
+                      "record_best"
+                  ] = safe_state_best(
+                      best
+                  )
+
+                  print(
+                      "Verified booking-source "
+                      "baseline established at "
+                      f"£{current_price:.0f} "
+                      f"with {best['seller']}."
+                  )
+
+                  print(
+                      "No migration notification sent."
+                  )
+
+
+              # ========================================================
+              # NEW ALL-TIME LOW
+              # ========================================================
+
+              elif (
+                  old_lowest is None
+                  or current_price
+                  <
+                  float(old_lowest)
+                  - 0.01
+              ):
+
+                  previous_record = (
+                      float(old_lowest)
+                      if old_lowest
+                      is not None
+                      else None
+                  )
+
+                  if (
+                      current_price
+                      < URGENT_PRICE
+                  ):
+
+                      title = (
+                          "🚨 PERTH FLIGHT UNDER £700"
+                      )
+
+                      priority = 5
+
+                      tags = [
+                          "rotating_light",
+                          "fire",
+                          "airplane",
+                      ]
+
+                  elif (
+                      current_price
+                      < HIGH_PRIORITY_PRICE
+                  ):
+
+                      title = (
+                          "🔥 PERTH FLIGHT UNDER £750"
+                      )
+
+                      priority = 4
+
+                      tags = [
+                          "fire",
+                          "airplane",
+                          "chart_with_downwards_trend",
+                      ]
+
+                  else:
+
+                      title = (
+                          "✈️ NEW LOWEST PERTH FARE"
+                      )
+
+                      priority = 3
+
+                      tags = [
+                          "airplane",
+                          "chart_with_downwards_trend",
+                      ]
+
+                  message = details
+
+                  if (
+                      previous_record
+                      is not None
+                  ):
+
+                      message += (
+                          "\n\nPrevious record: "
+                          f"£{previous_record:.0f}"
+                          "\nNEW RECORD: "
+                          f"£{current_price:.0f}"
+                          "\nDrop: "
+                          f"£{previous_record - current_price:.0f}"
+                      )
+
+                  send_notification(
+
+                      title,
+
+                      message,
+
+                      priority=priority,
+
+                      tags=tags,
+
+                      click_url=best[
+                          "click_url"
+                      ],
+                  )
+
+                  state[
+                      "lowest_price"
+                  ] = current_price
+
+                  state[
+                      "record_best"
+                  ] = safe_state_best(
+                      best
+                  )
+
+                  print(
+                      "NEW ALL-TIME LOW "
+                      "ALERT SENT"
+                  )
+
+
+              # ========================================================
+              # PRICE INCREASE / OLD CHEAPER FARE GONE
+              # ========================================================
+
+              elif (
+                  previous_price
+                  is not None
+                  and current_price
+                  >
+                  float(previous_price)
+                  + 0.01
+              ):
+
+                  old_price = float(
+                      previous_price
+                  )
+
+                  increase = (
+                      current_price
+                      - old_price
+                  )
+
+                  message = (
+                      "The previous cheapest "
+                      "verified booking option "
+                      "is no longer showing "
+                      "at that price."
+                      "\n\nWas: "
+                      f"£{old_price:.0f}"
+                      "\nCheapest verified now: "
+                      f"£{current_price:.0f}"
+                      "\nIncrease: "
+                      f"£{increase:.0f}"
+                  )
+
+                  old_description = (
+                      previous_details(
+                          old_best
+                      )
+                  )
+
+                  if old_description:
+
+                      message += (
+                          "\n\n"
+                          + old_description
+                      )
+
+                  message += (
+                      "\n\nCurrent cheapest:\n"
+                      + details
+                  )
+
+                  send_notification(
+
+                      "⚠️ CHEAPER FARE DISAPPEARED",
+
+                      message,
+
+                      priority=(
+                          priority_for_price(
+                              old_price
+                          )
+                      ),
+
+                      tags=[
+                          "warning",
+                          "airplane",
+                          "chart_with_upwards_trend",
+                      ],
+
+                      click_url=best[
+                          "click_url"
+                      ],
+                  )
+
+                  print(
+                      "PRICE-RISE ALERT SENT"
+                  )
+
+
+              # ========================================================
+              # GOT CHEAPER AGAIN, BUT NOT NEW RECORD
+              # ========================================================
+
+              elif (
+                  previous_price
+                  is not None
+                  and current_price
+                  <
+                  float(previous_price)
+                  - 0.01
+              ):
+
+                  old_price = float(
+                      previous_price
+                  )
+
+                  saving = (
+                      old_price
+                      - current_price
+                  )
+
+                  if (
+                      old_lowest is not None
+                      and abs(
+                          current_price
+                          - float(old_lowest)
+                      ) <= 0.01
+                  ):
+
+                      title = (
+                          "✈️ BEST FARE IS BACK"
+                      )
+
+                  elif (
+                      current_price
+                      < URGENT_PRICE
+                  ):
+
+                      title = (
+                          "🚨 FARE GOT CHEAPER — "
+                          "UNDER £700"
+                      )
+
+                  elif (
+                      current_price
+                      < HIGH_PRIORITY_PRICE
+                  ):
+
+                      title = (
+                          "🔥 FARE GOT CHEAPER — "
+                          "UNDER £750"
+                      )
+
+                  else:
+
+                      title = (
+                          "✈️ FARE GOT CHEAPER AGAIN"
+                      )
+
+                  message = (
+                      details
+                      + "\n\nWas: "
+                      f"£{old_price:.0f}"
+                      + "\nNow: "
+                      f"£{current_price:.0f}"
+                      + "\nDrop: "
+                      f"£{saving:.0f}"
+                  )
+
+                  if old_lowest is not None:
+
+                      message += (
+                          "\nAll-time record: "
+                          f"£{float(old_lowest):.0f}"
+                      )
+
+                  send_notification(
+
+                      title,
+
+                      message,
+
+                      priority=(
+                          priority_for_price(
+                              current_price
+                          )
+                      ),
+
+                      tags=[
+                          "airplane",
+                          "chart_with_downwards_trend",
+                      ],
+
+                      click_url=best[
+                          "click_url"
+                      ],
+                  )
+
+                  print(
+                      "CHEAPER-AGAIN ALERT SENT"
+                  )
+
+
+              # ========================================================
+              # VERIFIED FARES RETURNED
+              # ========================================================
+
+              elif was_missing:
+
+                  send_notification(
+
+                      "✈️ MATCHING FARES ARE BACK",
+
+                      (
+                          "A matching fare with "
+                          "a verified Google Flights "
+                          "booking seller is back.\n\n"
+                          + details
+                      ),
+
+                      priority=(
+                          priority_for_price(
+                              current_price
+                          )
+                      ),
+
+                      tags=[
+                          "airplane",
+                          "white_check_mark",
+                      ],
+
+                      click_url=best[
+                          "click_url"
+                      ],
+                  )
+
+                  print(
+                      "FARES-RETURNED "
+                      "ALERT SENT"
+                  )
+
+
+              # ========================================================
+              # NOTHING CHANGED
+              # ========================================================
+
+              else:
+
+                  print(
+                      "No alert needed."
+                  )
+
+                  print(
+                      "Current cheapest verified: "
+                      f"£{current_price:.0f} "
+                      f"with {best['seller']}"
+                  )
+
+                  if old_lowest is not None:
+
+                      print(
+                          "All-time verified record: "
+                          f"£{float(old_lowest):.0f}"
+                      )
+
+
+              # ========================================================
+              # REMEMBER CURRENT VERIFIED FARE
+              # ========================================================
+
+              state[
+                  "availability_missing"
+              ] = False
+
+              state[
+                  "last_seen_price"
+              ] = current_price
+
+              state[
+                  "last_best"
+              ] = safe_state_best(
+                  best
+              )
+
+              save_state(
+                  state
+              )
+
+          PY
+
+      - name: Save tracker state
+        run: |
+          if [ -z "$(git status --porcelain -- .flight-alert-state.json)" ]; then
+            echo "No tracker-state change to save."
+            exit 0
+          fi
+
+          git config user.name "flight-price-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .flight-alert-state.json
+
+          git commit \
+            -m "Update flight tracker state [skip ci]"
+
+          git pull \
+            --rebase \
+            origin master
+
+          git push \
+            origin HEAD:master

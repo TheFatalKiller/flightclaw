@@ -1,0 +1,609 @@
+name: Perth Flight Price Alerts
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 5 minutes, offset slightly from the top of the hour
+    - cron: "2-57/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: perth-flight-price-tracker
+  cancel-in-progress: false
+
+jobs:
+  check-flights:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Google Flights library
+        run: |
+          python -m pip install --upgrade pip
+          pip install "flights==0.9.0"
+
+      - name: Check London to Perth fares
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          from fli.models import (
+              Airport,
+              FlightSearchFilters,
+              FlightSegment,
+              MaxStops,
+              PassengerInfo,
+              SeatType,
+              SortBy,
+              TripType,
+          )
+          from fli.search import SearchFlights
+          from fli.search.client import get_client
+
+
+          # ============================================================
+          # SETTINGS
+          # ============================================================
+
+          DATES = [
+              "2027-01-10",
+              "2027-01-11",
+              "2027-01-12",
+              "2027-01-13",
+          ]
+
+          LONDON_AIRPORTS = [
+              Airport.LHR,
+              Airport.LGW,
+              Airport.STN,
+              Airport.LTN,
+              Airport.LCY,
+              Airport.SEN,
+          ]
+
+          DESTINATION = Airport.PER
+
+          HIGH_PRIORITY_PRICE = 650
+          URGENT_PRICE = 600
+
+          STATE_FILE = Path(".flight-alert-state.json")
+
+          NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+
+          GOOGLE_FLIGHTS_URL = (
+              "https://www.google.com/travel/flights"
+              "?hl=en-GB&curr=GBP&gl=GB"
+          )
+
+          GOOGLE_API_URL = (
+              "https://www.google.com/_/FlightsFrontendUi/data/"
+              "travel.frontend.flights.FlightsFrontendService/"
+              "GetShoppingResults"
+              "?hl=en-GB&curr=GBP&gl=GB"
+          )
+
+
+          if not NTFY_TOPIC:
+              raise RuntimeError(
+                  "NTFY_TOPIC is missing. Add it under "
+                  "Settings > Secrets and variables > Actions."
+              )
+
+
+          # ============================================================
+          # NTFY PUSH NOTIFICATIONS
+          # ============================================================
+
+          def send_notification(title, message, priority=3, tags="airplane"):
+              url = f"https://ntfy.sh/{NTFY_TOPIC}"
+
+              request = urllib.request.Request(
+                  url,
+                  data=message.encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "Title": title,
+                      "Priority": str(priority),
+                      "Tags": tags,
+                      "Click": GOOGLE_FLIGHTS_URL,
+                  },
+              )
+
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  print(
+                      f"ntfy notification sent: "
+                      f"{response.status} {title}"
+                  )
+
+
+          # ============================================================
+          # GOOGLE FLIGHTS SEARCH
+          #
+          # Google Flights' search protobuf contains a flag for:
+          # "Hide separate & self-transfer tickets".
+          #
+          # Fli/FlightClaw does not currently expose that switch through
+          # its normal public filter object, so we set that field before
+          # sending the request.
+          # ============================================================
+
+          def encode_filters_without_self_transfers(filters):
+              formatted = filters.format()
+
+              if (
+                  not isinstance(formatted, list)
+                  or len(formatted) < 2
+                  or not isinstance(formatted[1], list)
+              ):
+                  raise RuntimeError(
+                      "Unexpected Google Flights filter structure."
+                  )
+
+              # Google Flights field 17:
+              # hide_separate_self_transfer_tickets = true
+              while len(formatted[1]) <= 17:
+                  formatted[1].append(None)
+
+              formatted[1][17] = True
+
+              formatted_json = json.dumps(
+                  formatted,
+                  separators=(",", ":"),
+              )
+
+              wrapped = [
+                  None,
+                  formatted_json,
+              ]
+
+              return urllib.parse.quote(
+                  json.dumps(
+                      wrapped,
+                      separators=(",", ":"),
+                  )
+              )
+
+
+          def search_date(date):
+              filters = FlightSearchFilters(
+                  trip_type=TripType.ONE_WAY,
+                  passenger_info=PassengerInfo(adults=1),
+                  flight_segments=[
+                      FlightSegment(
+                          departure_airport=[
+                              [airport, 0]
+                              for airport in LONDON_AIRPORTS
+                          ],
+                          arrival_airport=[
+                              [DESTINATION, 0]
+                          ],
+                          travel_date=date,
+                      )
+                  ],
+                  seat_type=SeatType.ECONOMY,
+                  stops=MaxStops.TWO_OR_FEWER_STOPS,
+                  sort_by=SortBy.CHEAPEST,
+              )
+
+              encoded = encode_filters_without_self_transfers(filters)
+
+              client = get_client()
+
+              response = client.post(
+                  url=GOOGLE_API_URL,
+                  data=f"f.req={encoded}",
+                  impersonate="chrome",
+                  allow_redirects=True,
+              )
+
+              response.raise_for_status()
+
+              raw_response = response.text.lstrip(")]}'")
+              envelope = json.loads(raw_response)
+
+              if not envelope:
+                  return []
+
+              parsed_payload = envelope[0][2]
+
+              if not parsed_payload:
+                  return []
+
+              data = json.loads(parsed_payload)
+
+              raw_flights = []
+
+              # Google generally places returned flight groups here.
+              for index in (2, 3):
+                  if (
+                      index < len(data)
+                      and isinstance(data[index], list)
+                      and data[index]
+                      and isinstance(data[index][0], list)
+                  ):
+                      raw_flights.extend(data[index][0])
+
+              flights = []
+
+              for raw_flight in raw_flights:
+                  try:
+                      flight = SearchFlights._parse_flights_data(
+                          raw_flight
+                      )
+
+                      if flight is None:
+                          continue
+
+                      # Additional safety:
+                      # never allow an itinerary above 2 stops.
+                      if flight.stops > 2:
+                          continue
+
+                      # Reject itineraries requiring a change of airport
+                      # between connecting legs.
+                      airport_change = False
+
+                      for current_leg, next_leg in zip(
+                          flight.legs,
+                          flight.legs[1:],
+                      ):
+                          current_arrival = (
+                              current_leg.arrival_airport
+                          )
+                          next_departure = (
+                              next_leg.departure_airport
+                          )
+
+                          if current_arrival != next_departure:
+                              airport_change = True
+                              break
+
+                      if airport_change:
+                          continue
+
+                      flights.append(flight)
+
+                  except Exception as exc:
+                      print(
+                          f"Could not parse one result: {exc}"
+                      )
+
+              return flights
+
+
+          # ============================================================
+          # HELPERS
+          # ============================================================
+
+          def enum_text(value):
+              if hasattr(value, "value"):
+                  return str(value.value)
+              if hasattr(value, "name"):
+                  return str(value.name)
+              return str(value)
+
+
+          def describe_flight(flight, date):
+              legs = flight.legs
+
+              origin = (
+                  enum_text(legs[0].departure_airport)
+                  if legs
+                  else "London"
+              )
+
+              airlines = []
+              flight_numbers = []
+
+              for leg in legs:
+                  airline = enum_text(leg.airline)
+
+                  if airline not in airlines:
+                      airlines.append(airline)
+
+                  if leg.flight_number:
+                      flight_numbers.append(
+                          str(leg.flight_number)
+                      )
+
+              return {
+                  "price": round(float(flight.price), 2),
+                  "date": date,
+                  "origin": origin,
+                  "destination": "PER",
+                  "stops": int(flight.stops),
+                  "airlines": airlines,
+                  "flight_numbers": flight_numbers,
+                  "duration": int(flight.duration),
+              }
+
+
+          def format_duration(minutes):
+              hours = minutes // 60
+              mins = minutes % 60
+              return f"{hours}h {mins:02d}m"
+
+
+          def load_state():
+              if not STATE_FILE.exists():
+                  return {
+                      "initial_test_sent": False,
+                      "lowest_price": None,
+                  }
+
+              try:
+                  return json.loads(
+                      STATE_FILE.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              except Exception:
+                  return {
+                      "initial_test_sent": False,
+                      "lowest_price": None,
+                  }
+
+
+          def save_state(state):
+              STATE_FILE.write_text(
+                  json.dumps(
+                      state,
+                      indent=2,
+                      sort_keys=True,
+                  )
+                  + "\n",
+                  encoding="utf-8",
+              )
+
+
+          # ============================================================
+          # SEARCH ALL FOUR DATES
+          # ============================================================
+
+          candidates = []
+
+          for date in DATES:
+              print(
+                  f"Searching London -> Perth on {date}..."
+              )
+
+              try:
+                  flights = search_date(date)
+
+                  print(
+                      f"Found {len(flights)} suitable "
+                      f"non-self-transfer result(s)."
+                  )
+
+                  for flight in flights:
+                      candidates.append(
+                          describe_flight(
+                              flight,
+                              date,
+                          )
+                      )
+
+              except Exception as exc:
+                  print(
+                      f"Search failed for {date}: {exc}"
+                  )
+
+              # Be polite to Google Flights.
+              time.sleep(2)
+
+
+          if not candidates:
+              raise RuntimeError(
+                  "No valid flight results were returned "
+                  "for any of the four dates."
+              )
+
+
+          candidates.sort(
+              key=lambda item: item["price"]
+          )
+
+          best = candidates[0]
+
+          current_price = best["price"]
+
+          print("")
+          print("==============================")
+          print("CURRENT BEST FARE")
+          print("==============================")
+          print(
+              f"£{current_price:.0f} | "
+              f"{best['date']} | "
+              f"{best['origin']} -> PER | "
+              f"{best['stops']} stop(s)"
+          )
+          print(
+              "Airlines: "
+              + ", ".join(best["airlines"])
+          )
+          print(
+              "Flights: "
+              + ", ".join(best["flight_numbers"])
+          )
+          print(
+              "Duration: "
+              + format_duration(best["duration"])
+          )
+
+
+          # ============================================================
+          # ALERT LOGIC
+          # ============================================================
+
+          state = load_state()
+
+          old_lowest = state.get("lowest_price")
+
+          details = (
+              f"London → Perth\n"
+              f"One way: {best['date']}\n"
+              f"From: {best['origin']}\n"
+              f"Price: £{current_price:.0f}\n"
+              f"Stops: {best['stops']}\n"
+              f"Duration: "
+              f"{format_duration(best['duration'])}\n"
+              f"Airlines: "
+              f"{', '.join(best['airlines'])}\n"
+              f"Flights: "
+              f"{', '.join(best['flight_numbers'])}\n"
+              f"No separate/self-transfer tickets"
+          )
+
+
+          # FIRST SUCCESSFUL RUN ONLY
+          if not state.get("initial_test_sent", False):
+
+              if current_price < URGENT_PRICE:
+                  startup_priority = 5
+                  startup_tags = (
+                      "white_check_mark,"
+                      "rotating_light,airplane"
+                  )
+              elif current_price < HIGH_PRIORITY_PRICE:
+                  startup_priority = 4
+                  startup_tags = (
+                      "white_check_mark,"
+                      "fire,airplane"
+                  )
+              else:
+                  startup_priority = 3
+                  startup_tags = (
+                      "white_check_mark,airplane"
+                  )
+
+              send_notification(
+                  "✅ Flight tracker is LIVE",
+                  (
+                      "The automated tracker is now running.\n\n"
+                      + details
+                      + "\n\n"
+                      "It will now check approximately "
+                      "every 5 minutes and only alert "
+                      "when a NEW lowest fare appears."
+                  ),
+                  priority=startup_priority,
+                  tags=startup_tags,
+              )
+
+              state["initial_test_sent"] = True
+              state["lowest_price"] = current_price
+              state["best"] = best
+
+              save_state(state)
+
+              print(
+                  "First-run test notification sent."
+              )
+
+          # SUBSEQUENT RUNS:
+          # alert only if we beat the ALL-TIME LOW
+          elif (
+              old_lowest is None
+              or current_price < float(old_lowest)
+          ):
+
+              saving = (
+                  float(old_lowest) - current_price
+                  if old_lowest is not None
+                  else 0
+              )
+
+              if current_price < URGENT_PRICE:
+                  title = (
+                      "🚨 PERTH FLIGHT UNDER £600"
+                  )
+                  priority = 5
+                  tags = (
+                      "rotating_light,fire,airplane"
+                  )
+
+              elif current_price < HIGH_PRIORITY_PRICE:
+                  title = (
+                      "🔥 Perth flight under £650"
+                  )
+                  priority = 4
+                  tags = "fire,airplane"
+
+              else:
+                  title = (
+                      "✈️ NEW LOWEST PERTH FARE"
+                  )
+                  priority = 3
+                  tags = "airplane_chart_down"
+
+              message = details
+
+              if old_lowest is not None:
+                  message += (
+                      f"\n\nPrevious lowest: "
+                      f"£{float(old_lowest):.0f}"
+                      f"\nNew lowest: "
+                      f"£{current_price:.0f}"
+                      f"\nDrop: £{saving:.0f}"
+                  )
+
+              send_notification(
+                  title,
+                  message,
+                  priority=priority,
+                  tags=tags,
+              )
+
+              state["lowest_price"] = current_price
+              state["best"] = best
+
+              save_state(state)
+
+              print(
+                  f"NEW LOWEST: "
+                  f"£{old_lowest} -> "
+                  f"£{current_price}"
+              )
+
+          else:
+              print(
+                  f"No new lowest fare. "
+                  f"Current: £{current_price:.0f}; "
+                  f"record: £{float(old_lowest):.0f}"
+              )
+
+          PY
+
+      - name: Save tracker state
+        run: |
+          if git diff --quiet -- .flight-alert-state.json; then
+            echo "No tracker-state change to save."
+            exit 0
+          fi
+
+          git config user.name "flight-price-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .flight-alert-state.json
+          git commit -m "Update flight tracker state [skip ci]"
+          git push

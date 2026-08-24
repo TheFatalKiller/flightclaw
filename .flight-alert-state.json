@@ -7,28 +7,28 @@
     "airlines": [
       "Qatar Airways"
     ],
-    "date": "2027-01-13",
+    "date": "2027-01-10",
     "destination": "PER",
-    "duration": 1155,
+    "duration": 1230,
     "flight_numbers": [
-      "QR 110",
+      "QR 4",
       "QR 900"
     ],
     "marketed_as": [
-      "BA 7002",
-      "QR 900"
+      "BA 7004",
+      "BA 6376"
     ],
     "origin_code": "LHR",
     "origin_name": "Heathrow Airport",
-    "price": 840.0,
-    "search_url": "https://www.google.com/travel/flights?hl=en&gl=uk&curr=GBP&tfs=CBwQAhpgEgoyMDI3LTAxLTEzIh8KA0xIUhIKMjAyNy0wMS0xMxoDRE9IKgJRUjIDMTEwIh8KA0RPSBIKMjAyNy0wMS0xNBoDUEVSKgJRUjIDOTAwagcIARIDTEhScgcIARIDUEVSQAFIAXABmAEC&tfu=EgIIAQ",
-    "seller": "Carlton Leisure",
+    "price": 741.0,
+    "search_url": "https://www.google.com/travel/flights?hl=en&gl=uk&curr=GBP&tfs=CBwQAhpeEgoyMDI3LTAxLTEwIh0KA0xIUhIKMjAyNy0wMS0xMBoDRE9IKgJRUjIBNCIfCgNET0gSCjIwMjctMDEtMTEaA1BFUioCUVIyAzkwMGoHCAESA0xIUnIHCAESA1BFUkABSAFwAZgBAg&tfu=EgIIAQ",
+    "seller": "KILROY",
     "seller_type": "OTA / travel agent",
-    "shopping_price": 887.0,
+    "shopping_price": 913.0,
     "single_ticket_verified": true,
     "stops": 1
   },
-  "last_seen_price": 840.0,
+  "last_seen_price": 741.0,
   "lowest_price": 662.0,
   "record_best": {
     "airlines": [

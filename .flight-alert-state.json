@@ -20,15 +20,15 @@
     ],
     "origin_code": "LHR",
     "origin_name": "Heathrow Airport",
-    "price": 722.0,
+    "price": 734.0,
     "search_url": "https://www.google.com/travel/flights?hl=en&gl=uk&curr=GBP&tfs=CBwQAhpeEgoyMDI3LTAxLTExIh0KA0xIUhIKMjAyNy0wMS0xMRoDRE9IKgJRUjIBNCIfCgNET0gSCjIwMjctMDEtMTIaA1BFUioCUVIyAzkwMGoHCAESA0xIUnIHCAESA1BFUkABSAFwAZgBAg&tfu=EgIIAQ",
-    "seller": "Travel Up",
+    "seller": "Opodo",
     "seller_type": "OTA / travel agent",
     "shopping_price": 837.0,
     "single_ticket_verified": true,
     "stops": 1
   },
-  "last_seen_price": 722.0,
+  "last_seen_price": 734.0,
   "lowest_price": 662.0,
   "record_best": {
     "airlines": [
